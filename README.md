@@ -3,6 +3,7 @@
 
 Code to reproduce the experiments reported in the paper:
 > Mido Assran, Nicolas Loizou, Nicolas Ballas, and Michael Rabbat, "Stochastic Gradient Push for Distributed Deep Learning," ICML 2019.
+
 If you use this code for your research, please cite the paper.
 
 It implements the following algorithms:
