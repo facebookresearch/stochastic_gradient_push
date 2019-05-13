@@ -1,4 +1,10 @@
 #!/bin/bash
+# Copyright (c) Facebook, Inc. and its affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+#
 #SBATCH --job-name=transformer_test_2
 #SBATCH --output=transformer_ar_test_2.out
 #SBATCH --error=transformer_ar_test_2.err

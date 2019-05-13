@@ -1,4 +1,10 @@
 #!/bin/bash
+# Copyright (c) Facebook, Inc. and its affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+#
 #SBATCH --job-name=DPSGD_ETH
 #SBATCH --output=DPSGD_ETH.out
 #SBATCH --error=DPSGD_ETH.err
