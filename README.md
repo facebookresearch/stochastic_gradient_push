@@ -72,3 +72,6 @@ The neural network modules use implementations of PushSum and gossip algorithms 
 * `gossip_modules/graph_manager.py` contains code to generate different communication topologies, and
 * `gossip_modules/mixing_manager.py` contains code to produce weights of the mixing matrices, given a topology.
 
+## License
+See the [LICENSE](./LICENSE) file for details about the license under which this code is made available.
+
