@@ -34,34 +34,40 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
 
+from apex import amp
+from apex.parallel import DistributedDataParallel as ApexDDP
+from apex.fp16_utils import network_to_half, FP16_Optimizer
 from torchvision.models.resnet import Bottleneck
 from torch.nn.parameter import Parameter
+
 
 from experiment_utils import make_logger
 from experiment_utils import Meter
 from experiment_utils import ClusterManager
-from gossip_module import AllReduceDataParallel
-from gossip_module import GossipDataParallel, SimpleGossipDataParallel
-from gossip_module import DynamicDirectedExponentialGraph as DDEGraph
+from experiment_utils import get_tcp_interface_name
+from gossip_module import GossipDataParallel
 from gossip_module import DynamicBipartiteExponentialGraph as DBEGraph
-from gossip_module import DynamicDirectedLinearGraph as DDLGraph
 from gossip_module import DynamicBipartiteLinearGraph as DBLGraph
+from gossip_module import DynamicDirectedExponentialGraph as DDEGraph
+from gossip_module import DynamicDirectedLinearGraph as DDLGraph
+from gossip_module import NPeerDynamicDirectedExponentialGraph as NPDDEGraph
+from gossip_module import RingGraph
 from gossip_module import UniformMixing
 
 GRAPH_TOPOLOGIES = {
-    0: DDEGraph,  # Dynamic Directed Exponential
-    1: DBEGraph,  # Dynamic Bipartite Exponential
-    2: DDLGraph,  # Dynamic Directed Linear
-    3: DBLGraph  # Dynamic Bipartite Linear
+    0: DDEGraph,    # Dynamic Directed Exponential
+    1: DBEGraph,    # Dynamic Bipartite Exponential
+    2: DDLGraph,    # Dynamic Directed Linear
+    3: DBLGraph,    # Dynamic Bipartite Linear
+    4: RingGraph,   # Ring
+    5: NPDDEGraph,  # N-Peer Dynamic Directed Exponential
+    -1: None,
 }
 
 MIXING_STRATEGIES = {
-    0: UniformMixing  # assign weights uniformly
+    0: UniformMixing,  # assign weights uniformly
+    -1: None,
 }
-
-# path to train/validation data
-TRAIN_DIR = 'PATH_to_IMAGENET/train'
-VAL_DIR = 'PATH_to_IMAGENET/val'
 
 # --------------------------------------------------------------------------- #
 # Parse command line arguments (CLAs):
@@ -71,16 +77,18 @@ parser.add_argument('--all_reduce', default='False', type=str,
                     help='whether to use all-reduce or gossip')
 parser.add_argument('--batch_size', default=32, type=int,
                     help='per-agent batch size')
-parser.add_argument('--single_threaded', default='False', type=str,
-                    help='whether to use single-threaded model wrapper')
-parser.add_argument('--distributed', default='True', type=str,
-                    help='whether to run script in distributed mode')
 parser.add_argument('--lr', default=0.1, type=float,
                     help='reference learning rate (for 256 sample batch-size)')
 parser.add_argument('--num_dataloader_workers', default=10, type=int,
                     help='number of dataloader workers to fork from main')
 parser.add_argument('--num_epochs', default=90, type=int,
                     help='number of epochs to train')
+parser.add_argument('--num_iterations_per_training_epoch', default=None,
+                    type=int, help='number of iterations to run in the '
+                    'training loop. To be used only for testing - to allow '
+                    'training loop to exit early. None indicates that the '
+                    'number of iterations per epoch will be '
+                    '(num training instances)/(batch size)')
 parser.add_argument('--momentum', default=0.9, type=float,
                     help='optimization momentum')
 parser.add_argument('--weight_decay', default=1e-4, type=float,
@@ -90,16 +98,18 @@ parser.add_argument('--nesterov', default='False', type=str,
                          'otherwise will use regular Polyak momentum')
 parser.add_argument('--push_sum', default='True', type=str,
                     help='whether to use push-sum or push-pull gossip')
-parser.add_argument('--graph_type', default=0, type=int,
+parser.add_argument('--graph_type', default=5, type=int,
+                    choices=GRAPH_TOPOLOGIES,
                     help='the graph topology to use for gossip'
                          'cf. the gossip_module graph_manager for available'
                          'graph topologies and their corresponding int-id')
 parser.add_argument('--mixing_strategy', default=0, type=int,
+                    choices=MIXING_STRATEGIES,
                     help='the mixing strategy to use for gossip'
                          'cf. the gossip_module mixing_manager for available'
                          'mixing strategies and their corresponding int-id.')
-parser.add_argument('--schedule', nargs='+', type=float,
-                    help='learning rate schedule')
+parser.add_argument('--schedule', nargs='+', default='30 0.1 60 0.1 80 0.1',
+                    type=float, help='learning rate schedule')
 parser.add_argument('--peers_per_itr_schedule', nargs='+', type=int,
                     help='epoch schedule of num peers to send msgs to;'
                          'the expected format is list[epoch, num_peers]'
@@ -117,12 +127,9 @@ parser.add_argument('--seed', default=47, type=int,
                     help='seed used for ALL stochastic elements in script')
 parser.add_argument('--resume', default='False', type=str,
                     help='whether to resume from previously saved checkpoint')
-parser.add_argument('--resume_epoch', default=0, type=int,
-                    help='which epoch to load AR checkpoint from')
-parser.add_argument('--backend', default='nccl', type=str,
+parser.add_argument('--backend', default='nccl',
+                    choices=['nccl', 'gloo', 'mpi'],
                     help='torch.distributed backend')
-parser.add_argument('--bs_fpath', default='ar_sgd_batch.sh', type=str,
-                    help='batch-script file path to resubmit on preemption')
 parser.add_argument('--tag', default='', type=str,
                     help='tag used to prepend checkpoint file names')
 parser.add_argument('--print_freq', default=10, type=int,
@@ -136,19 +143,39 @@ parser.add_argument('--checkpoint_all', default='True', type=str,
                     help='True: save each agents model at each epoch'
                          'False: save just one (rank 0) model at each epoch')
 parser.add_argument('--overwrite_checkpoints', default='True', type=str,
-                    help='False: save checkpoint at each epoch with unique tag'
-                         'True: overwrite checkpoints from one epoch to next')
+                    help='True: save checkpoint at each epoch with unique tag'
+                         'False: overwrite checkpoints from one epoch to next')
 parser.add_argument('--master_port', default='40100', type=str,
                     help='port used to initialize distributed backend')
-parser.add_argument('--user_name', default='user', type=str,
-                    help='user-name used to define directory for log-files')
+parser.add_argument('--checkpoint_dir', type=str,
+                    help='directory for saving log-files')
+parser.add_argument('--network_interface_type', default='infiniband',
+                    choices=['infiniband', 'ethernet'],
+                    help='network interface type to be used for communication')
+parser.add_argument('--fp16', action='store_true',
+                    help='whether to enable floating point 16 for speedup')
+parser.add_argument('--amp', action='store_true',
+                    help='whether to use apex amp for converting to fp16 '
+                    'instead of FP16Optimizer')
+parser.add_argument('--apex_ddp', action='store_true',
+                    help='whether to use DistributedDataParallel by Apex')
+parser.add_argument('--num_itr_ignore', type=int, default=10,
+                    help='number of iterations to ignore before timing. A '
+                         'value of 0 would imply no iterations should be '
+                         'ignored')
+parser.add_argument('--dataset_dir', type=str)
+parser.add_argument('--no_cuda_streams', action='store_true',
+                    help='do not use multiple cuda streams which are used to '
+                    'speed up gossiping')
 # --------------------------------------------------------------------------- #
 
 
 def main():
 
-    global args, state, log
+    global amp_handle, args, state, log
     args = parse_args()
+    if args.fp16 and args.amp:
+        amp_handle = amp.init()
 
     log = make_logger(args.rank, args.verbose)
     log.info('args: {}'.format(args))
@@ -159,45 +186,40 @@ def main():
     torch.cuda.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
 
-    if args.distributed:
-        # initialize torch distributed backend
-        os.environ['MASTER_ADDR'] = args.master_addr
-        os.environ['MASTER_PORT'] = args.master_port
-        dist.init_process_group(backend=args.backend,
-                                world_size=args.world_size,
-                                rank=args.rank)
-
     # init model, loss, and optimizer
     model = init_model()
     if args.all_reduce:
-        model = AllReduceDataParallel(model,
-                                      distributed=args.distributed,
-                                      comm_device=args.comm_device,
-                                      verbose=args.verbose)
-    else:
-        if args.single_threaded:
-            model = SimpleGossipDataParallel(model,
-                                             distributed=args.distributed,
-                                             graph=args.graph,
-                                             comm_device=args.comm_device,
-                                             push_sum=args.push_sum,
-                                             verbose=args.verbose)
+        if args.fp16 and args.apex_ddp:
+            model = ApexDDP(model)
         else:
-            model = GossipDataParallel(model,
-                                       distributed=args.distributed,
-                                       graph=args.graph,
-                                       mixing=args.mixing,
-                                       comm_device=args.comm_device,
-                                       push_sum=args.push_sum,
-                                       overlap=args.overlap,
-                                       synch_freq=args.synch_freq,
-                                       verbose=args.verbose)
-    criterion = nn.CrossEntropyLoss().cuda()
+            model = torch.nn.parallel.DistributedDataParallel(model)
+    else:
+        model = GossipDataParallel(model,
+                                   graph=args.graph,
+                                   mixing=args.mixing,
+                                   comm_device=args.comm_device,
+                                   push_sum=args.push_sum,
+                                   overlap=args.overlap,
+                                   synch_freq=args.synch_freq,
+                                   verbose=args.verbose,
+                                   use_streams=not args.no_cuda_streams)
+
+    core_criterion = nn.KLDivLoss(reduction='batchmean').cuda()
+    log_softmax = nn.LogSoftmax(dim=1)
+
+    def criterion(input, kl_target):
+        assert kl_target.dtype != torch.int64
+        loss = core_criterion(log_softmax(input), kl_target)
+        return loss
+
     optimizer = torch.optim.SGD(model.parameters(),
                                 lr=args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay,
                                 nesterov=args.nesterov)
+    if args.fp16 and not args.amp:
+        optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True,
+                                   verbose=False)
     optimizer.zero_grad()
 
     # dictionary used to encode training state
@@ -215,18 +237,16 @@ def main():
     # module used to relaunch jobs and handle external termination signals
     cmanager = ClusterManager(rank=args.rank,
                               world_size=args.world_size,
-                              bs_fname=args.bs_fpath,
                               model_tag=args.tag,
                               state=state,
                               all_workers=args.checkpoint_all)
 
     # resume from checkpoint
     if args.resume:
-        f_fpath = cmanager.checkpoint_fpath
-        if os.path.isfile(f_fpath):
+        if os.path.isfile(cmanager.checkpoint_fpath):
             log.info("=> loading checkpoint '{}'"
-                     .format(f_fpath))
-            checkpoint = torch.load(f_fpath)
+                     .format(cmanager.checkpoint_fpath))
+            checkpoint = torch.load(cmanager.checkpoint_fpath)
             update_state(state, {
                           'epoch': checkpoint['epoch'],
                           'itr': checkpoint['itr'],
@@ -242,13 +262,8 @@ def main():
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             log.info("=> loaded checkpoint '{}' (epoch {}; itr {})"
-                     .format(f_fpath,
+                     .format(cmanager.checkpoint_fpath,
                              checkpoint['epoch'], checkpoint['itr']))
-
-            # synch models that are loaded
-            if not args.overlap or args.all_reduce:
-                model.transfer_params()
-
         else:
             log.info("=> no checkpoint found at '{}'"
                      .format(cmanager.checkpoint_fpath))
@@ -262,7 +277,7 @@ def main():
     nn_meter = Meter(state['nn_meter'])
 
     # initalize log file
-    if not args.resume:
+    if not os.path.exists(args.out_fname):
         with open(args.out_fname, 'w') as f:
             print('BEGIN-TRAINING\n'
                   'World-Size,{ws}\n'
@@ -285,6 +300,7 @@ def main():
     start_epoch = state['epoch']
     elapsed_time = state['elapsed_time']
     begin_time = time.time() - state['elapsed_time']
+    best_val_prec1 = 0
     for epoch in range(start_epoch, args.num_epochs):
 
         # deterministic seed used to load agent's subset of data
@@ -295,10 +311,11 @@ def main():
             update_peers_per_itr(model, epoch)
 
         # start all agents' training loop at same time
-        model.block()
+        if not args.all_reduce:
+            model.block()
         train(model, criterion, optimizer,
               batch_meter, data_meter, nn_meter,
-              loader, epoch, start_itr, begin_time)
+              loader, epoch, start_itr, begin_time, args.num_itr_ignore)
 
         start_itr = 0
         if not args.train_fast:
@@ -326,21 +343,26 @@ def main():
                               bt=batch_meter,
                               dt=data_meter, nt=nn_meter,
                               filler=-1, val=prec1), file=f)
+
+            if prec1 > best_val_prec1:
+                update_state(state, {'is_best': True})
+                best_val_prec1 = prec1
+
             epoch_id = epoch if not args.overwrite_checkpoints else None
-            cmanager.save_checkpoint(epoch_id)
+
+            cmanager.save_checkpoint(
+                epoch_id, requeue_on_signal=(epoch != args.num_epochs-1))
 
     if args.train_fast:
         val_loader = make_dataloader(args, train=False)
         prec1 = validate(val_loader, model, criterion)
         log.info('Test accuracy: {}'.format(prec1))
 
-    cmanager.halt = True
-
     log.info('elapsed_time {0}'.format(elapsed_time))
 
 
 def train(model, criterion, optimizer, batch_meter, data_meter, nn_meter,
-          loader, epoch, itr, begin_time):
+          loader, epoch, itr, begin_time, num_itr_ignore):
 
     losses = Meter(ptag='Loss')
     top1 = Meter(ptag='Prec@1')
@@ -361,32 +383,49 @@ def train(model, criterion, optimizer, batch_meter, data_meter, nn_meter,
 
     log.debug('Training (epoch {})'.format(epoch))
 
-    model.communicator_warmup()
-
     batch_time = time.time()
     for i, (batch, target) in enumerate(_train_loader, start=itr):
+        if args.fp16:
+            batch = batch.cuda(non_blocking=True).half()
 
         target = target.cuda(non_blocking=True)
-        data_meter.update(time.time() - batch_time)
+        # create one-hot vector from target
+        kl_target = torch.zeros(target.shape[0], 1000, device='cuda').scatter_(
+            1, target.view(-1, 1), 1)
+
+        if num_itr_ignore == 0:
+            data_meter.update(time.time() - batch_time)
 
         # ----------------------------------------------------------- #
         # Forward/Backward pass
         # ----------------------------------------------------------- #
         nn_time = time.time()
         output = model(batch)
-        loss = criterion(output, target)
-        loss.backward()
+        loss = criterion(output, kl_target)
+
+        if args.fp16:
+            if args.amp:
+                with amp_handle.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                optimizer.backward(loss)
+        else:
+            loss.backward()
+
         if i % 100 == 0:
             update_learning_rate(optimizer, epoch, itr=i,
                                  itr_per_epoch=len(loader))
         optimizer.step()  # optimization update
         optimizer.zero_grad()
-        if not args.overlap or args.all_reduce:
+        if not args.overlap and not args.all_reduce:
+            log.debug('Transferring params')
             model.transfer_params()
-        nn_meter.update(time.time() - nn_time)
+        if num_itr_ignore == 0:
+            nn_meter.update(time.time() - nn_time)
         # ----------------------------------------------------------- #
 
-        batch_meter.update(time.time() - batch_time)
+        if num_itr_ignore == 0:
+            batch_meter.update(time.time() - batch_time)
         batch_time = time.time()
 
         log_time = time.time()
@@ -406,8 +445,14 @@ def train(model, criterion, optimizer, batch_meter, data_meter, nn_meter,
                               dt=data_meter, nt=nn_meter,
                               loss=losses, top1=top1,
                               top5=top5), file=f)
+        if num_itr_ignore > 0:
+            num_itr_ignore -= 1
         log_time = time.time() - log_time
         log.debug(log_time)
+
+        if (args.num_iterations_per_training_epoch != -1 and
+                i+1 == args.num_iterations_per_training_epoch):
+            break
 
     with open(args.out_fname, '+a') as f:
         print('{ep},{itr},{bt},{nt},{dt},'
@@ -434,11 +479,19 @@ def validate(val_loader, model, criterion):
     with torch.no_grad():
         for i, (features, target) in enumerate(val_loader):
 
+            if args.fp16:
+                features = features.cuda(non_blocking=True).half()
+                # This is not needed but let it be since there is no harm
+
             target = target.cuda(non_blocking=True)
+            # create one-hot vector from target
+            kl_target = torch.zeros(
+                target.shape[0], 1000, device='cuda').scatter_(
+                    1, target.view(-1, 1), 1)
 
             # compute output
             output = model(features)
-            loss = criterion(output, target)
+            loss = criterion(output, kl_target)
 
             # measure accuracy and record loss
             prec1, prec5 = accuracy(output, target, topk=(1, 5))
@@ -477,8 +530,6 @@ def update_state(state, update_dict):
 
 def update_peers_per_itr(model, epoch):
     """ Update the model's peers per itr according to specified schedule """
-    if args.single_threaded:
-        return
     ppi = None
     e_max = -1
     for e in args.ppi_schedule:
@@ -522,21 +573,22 @@ def update_learning_rate(optimizer, epoch, itr=None, itr_per_epoch=None,
 def make_dataloader(args, train=True):
     """ Returns train/val distributed dataloaders (cf. ImageNet in 1hr) """
 
-    train_dir = TRAIN_DIR
-    val_dir = VAL_DIR
+    data_dir = args.dataset_dir
+    train_dir = os.path.join(data_dir, 'train')
+    val_dir = os.path.join(data_dir, 'val')
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
     if train:
         log.debug('fpaths train {}'.format(train_dir))
-        train_dataset = datasets.ImageFolder(train_dir, transforms.Compose([
-                            transforms.RandomResizedCrop(224),
-                            transforms.RandomHorizontalFlip(),
-                            transforms.ToTensor(),
-                            normalize]))
+        train_dataset = datasets.ImageFolder(
+            train_dir, transforms.Compose([
+                transforms.RandomResizedCrop(224),
+                transforms.RandomHorizontalFlip(), transforms.ToTensor(),
+                normalize]))
 
-        # sampler produces indices used to assign data samples to each agent
+        # sampler produces indices used to assign each agent data samples
         train_sampler = torch.utils.data.distributed.DistributedSampler(
                             dataset=train_dataset,
                             num_replicas=args.world_size,
@@ -552,6 +604,7 @@ def make_dataloader(args, train=True):
 
     else:
         log.debug('fpaths val {}'.format(val_dir))
+
         val_loader = torch.utils.data.DataLoader(
             datasets.ImageFolder(val_dir, transforms.Compose([
                 transforms.Resize(256),
@@ -573,24 +626,17 @@ def parse_args():
         Master port <-- any free port (doesn't really matter)
     """
     args = parser.parse_args()
-    ClusterManager.set_user_name(args.user_name)
+    ClusterManager.set_checkpoint_dir(args.checkpoint_dir)
 
-    args.distributed = True if args.distributed == 'True' else False
-    if not args.distributed:
-        args.rank = 0
-        args.world_size = 1
-        args.device_id = 0
-        args.master_addr = 'localhost'
+    # rank and world_size need to be changed depending on the scheduler being
+    # used to run the distributed jobs
+    args.master_addr = os.environ['HOSTNAME']
+    if args.backend == 'mpi':
+        args.rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
+        args.world_size = int(os.environ['OMPI_UNIVERSE_SIZE'])
     else:
-        args.master_addr = os.environ['HOSTNAME']
-        if args.backend == 'mpi':
-            args.rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
-            args.world_size = int(os.environ['OMPI_UNIVERSE_SIZE'])
-            args.device_id = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
-        else:
-            args.rank = int(os.environ['SLURM_PROCID'])
-            args.world_size = int(os.environ['SLURM_NTASKS'])
-            args.device_id = int(os.environ['SLURM_LOCALID'])
+        args.rank = int(os.environ['SLURM_PROCID'])
+        args.world_size = int(os.environ['SLURM_NTASKS'])
     args.out_fname = ClusterManager.CHECKPOINT_DIR \
         + args.tag \
         + 'out_r' + str(args.rank) \
@@ -602,13 +648,12 @@ def parse_args():
     args.nesterov = True if args.nesterov == 'True' else False
     args.checkpoint_all = True if args.checkpoint_all == 'True' else False
     args.warmup = True if args.warmup == 'True' else False
-    args.cpu_comm = True if args.backend == 'tcp' else False
-    args.comm_device = torch.device('cpu') if args.cpu_comm else torch.device('cuda')
     args.overlap = True if args.overlap == 'True' else False
-    args.single_threaded = True if args.single_threaded == 'True' else False
-    args.data_preloaded = True if args.data_preloaded == 'True' else False
     args.push_sum = True if args.push_sum == 'True' else False
     args.all_reduce = True if args.all_reduce == 'True' else False
+    args.cpu_comm = True if (args.backend == 'gloo' and not args.push_sum and
+                             not args.all_reduce) else False
+    args.comm_device = torch.device('cpu') if args.cpu_comm else torch.device('cuda')
     args.overwrite_checkpoints = True if args.overwrite_checkpoints == 'True' else False
     args.lr_schedule = {}
     if args.schedule is None:
@@ -636,18 +681,48 @@ def parse_args():
     del args.peers_per_itr_schedule
     # must specify how many peers to communicate from the start of training
     assert 0 in args.ppi_schedule
-    if args.distributed:
-        try:
-            args.graph = GRAPH_TOPOLOGIES[args.graph_type](
-                args.rank, args.world_size, peers_per_itr=args.ppi_schedule[0])
-        except Exception:
-            args.graph = None
-        try:
-            args.mixing = MIXING_STRATEGIES[args.mixing_strategy](args.graph)
-        except Exception:
-            args.mixing = None
-    else:
-        args.graph, args.mixing = None, None
+
+    if args.all_reduce:
+        assert args.graph_type == -1
+
+    if args.fp16:
+        assert args.backend == 'nccl'
+
+    if args.backend == 'gloo':
+        assert args.network_interface_type == 'ethernet'
+        os.environ['GLOO_SOCKET_IFNAME'] = get_tcp_interface_name(
+            network_interface_type=args.network_interface_type
+        )
+    elif args.network_interface_type == 'ethernet':
+        if args.backend == 'nccl':
+            os.environ['NCCL_SOCKET_IFNAME'] = get_tcp_interface_name(
+                network_interface_type=args.network_interface_type
+            )
+            os.environ['NCCL_IB_DISABLE'] = '1'
+        else:
+            raise NotImplementedError
+
+    # initialize torch distributed backend
+    os.environ['MASTER_ADDR'] = args.master_addr
+    os.environ['MASTER_PORT'] = args.master_port
+    dist.init_process_group(backend=args.backend,
+                            world_size=args.world_size,
+                            rank=args.rank)
+
+    args.graph, args.mixing = None, None
+    graph_class = GRAPH_TOPOLOGIES[args.graph_type]
+    if graph_class:
+        # dist.barrier is done here to ensure the NCCL communicator is created
+        # here. This prevents an error which may be caused if the NCCL
+        # communicator is created at a time gap of more than 5 minutes in
+        # different processes
+        dist.barrier()
+        args.graph = graph_class(
+            args.rank, args.world_size, peers_per_itr=args.ppi_schedule[0])
+
+    mixing_class = MIXING_STRATEGIES[args.mixing_strategy]
+    if mixing_class and args.graph:
+        args.mixing = mixing_class(args.graph, args.comm_device)
 
     return args
 
@@ -665,6 +740,9 @@ def init_model():
             num_features = m.bn3.num_features
             m.bn3.weight = Parameter(torch.zeros(num_features))
     model.fc.weight.data.normal_(0, 0.01)
+    model.cuda()
+    if args.fp16 and not args.amp:
+        model = network_to_half(model)
     return model
 
 

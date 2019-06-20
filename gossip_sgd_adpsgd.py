@@ -35,32 +35,33 @@ import torchvision.transforms as transforms
 from torchvision.models.resnet import Bottleneck
 from torch.nn.parameter import Parameter
 
+from experiment_utils import get_tcp_interface_name
 from experiment_utils import make_logger
 from experiment_utils import Meter
 from experiment_utils import ClusterManager
-from gossip_module import AllReduceDataParallel
-from gossip_module import GossipDataParallel, SimpleGossipDataParallel
 from gossip_module import BilatGossipDataParallel
 from gossip_module import DynamicDirectedExponentialGraph as DDEGraph
 from gossip_module import DynamicBipartiteExponentialGraph as DBEGraph
 from gossip_module import DynamicDirectedLinearGraph as DDLGraph
 from gossip_module import DynamicBipartiteLinearGraph as DBLGraph
+from gossip_module import NPeerDynamicDirectedExponentialGraph as NPDDEGraph
+from gossip_module import RingGraph
 from gossip_module import UniformMixing
 
 GRAPH_TOPOLOGIES = {
-    0: DDEGraph,  # Dynamic Directed Exponential
-    1: DBEGraph,  # Dynamic Bipartite Exponential
-    2: DDLGraph,  # Dynamic Directed Linear
-    3: DBLGraph  # Dynamic Bipartite Linear
+    0: DDEGraph,    # Dynamic Directed Exponential
+    1: DBEGraph,    # Dynamic Bipartite Exponential
+    2: DDLGraph,    # Dynamic Directed Linear
+    3: DBLGraph,    # Dynamic Bipartite Linear
+    4: RingGraph,   # Ring
+    5: NPDDEGraph,  # N-Peer Dynamic Directed Exponential
+    -1: None,
 }
 
 MIXING_STRATEGIES = {
-    0: UniformMixing  # assign weights uniformly
+    0: UniformMixing,  # assign weights uniformly
+    -1: None,
 }
-
-# path to train/validation data
-TRAIN_DIR = 'PATH_to_IMAGENET/train'
-VAL_DIR = 'PATH_to_IMAGENET/val'
 
 # --------------------------------------------------------------------------- #
 # Parse command line arguments (CLAs):
@@ -74,10 +75,6 @@ parser.add_argument('--shared_fpath', default='', type=str,
                     help='file path to use for global iteration tracking')
 parser.add_argument('--batch_size', default=32, type=int,
                     help='per-agent batch size')
-parser.add_argument('--single_threaded', default='False', type=str,
-                    help='whether to use single-threaded model wrapper')
-parser.add_argument('--distributed', default='True', type=str,
-                    help='whether to run script in distributed mode')
 parser.add_argument('--lr', default=0.1, type=float,
                     help='reference learning rate (for 256 sample batch-size)')
 parser.add_argument('--num_dataloader_workers', default=10, type=int,
@@ -121,6 +118,7 @@ parser.add_argument('--seed', default=47, type=int,
 parser.add_argument('--resume', default='False', type=str,
                     help='whether to resume from previously saved checkpoint')
 parser.add_argument('--backend', default='nccl', type=str,
+                    choices=['nccl', 'gloo', 'mpi'],
                     help='torch.distributed backend')
 parser.add_argument('--bs_fpath', default='', type=str,
                     help='batch-script file path to resubmit on preemption')
@@ -138,8 +136,12 @@ parser.add_argument('--checkpoint_all', default='True', type=str,
                          'False: save just one (rank 0) model at each itr')
 parser.add_argument('--master_port', default='40100', type=str,
                     help='port used to initialize distributed backend')
-parser.add_argument('--user_name', default='user', type=str,
-                    help='user-name used to define directory for log-files')
+parser.add_argument('--checkpoint_dir', type=str,
+                    help='directory for saving log-files')
+parser.add_argument('--network_interface_type', default='ethernet',
+                    choices=['infiniband', 'ethernet'],
+                    help='network interface type to be used for communication')
+parser.add_argument('--dataset_dir', type=str)
 # --------------------------------------------------------------------------- #
 
 
@@ -157,56 +159,19 @@ def main():
     torch.cuda.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
 
-    if args.distributed and not args.bilat:
-        # initialize torch distributed backend
-        os.environ['MASTER_ADDR'] = args.master_addr
-        os.environ['MASTER_PORT'] = args.master_port
-        dist.init_process_group(backend=args.backend,
-                                world_size=args.world_size,
-                                rank=args.rank)
-        log.info('my dist rank {}'.format(dist.get_rank()))
-
     # init model, loss, and optimizer
     model = init_model()
-    if args.all_reduce:
-        model = AllReduceDataParallel(model,
-                                      distributed=args.distributed,
-                                      comm_device=args.comm_device,
-                                      verbose=args.verbose)
-    elif args.bilat:
-        model = BilatGossipDataParallel(model,
-                                        distributed=args.distributed,
-                                        master_addr=args.master_addr,
-                                        master_port=args.master_port,
-                                        backend=args.backend,
-                                        world_size=args.world_size,
-                                        rank=args.rank,
-                                        graph=args.graph,
-                                        mixing=args.mixing,
-                                        comm_device=args.comm_device,
-                                        lr=args.lr,
-                                        momentum=args.momentum,
-                                        weight_decay=args.weight_decay,
-                                        nesterov=args.nesterov,
-                                        verbose=args.verbose)
-    else:
-        if args.single_threaded:
-            model = SimpleGossipDataParallel(model,
-                                             distributed=args.distributed,
-                                             graph=args.graph,
-                                             comm_device=args.comm_device,
-                                             push_sum=args.push_sum,
-                                             verbose=args.verbose)
-        else:
-            model = GossipDataParallel(model,
-                                       distributed=args.distributed,
-                                       graph=args.graph,
-                                       mixing=args.mixing,
-                                       comm_device=args.comm_device,
-                                       push_sum=args.push_sum,
-                                       overlap=args.overlap,
-                                       synch_freq=args.synch_freq,
-                                       verbose=args.verbose)
+
+    assert args.bilat and not args.all_reduce
+    model = BilatGossipDataParallel(
+        model, master_addr=args.master_addr, master_port=args.master_port,
+        backend=args.backend, world_size=args.world_size, rank=args.rank,
+        graph_class=args.graph_class, mixing_class=args.mixing_class,
+        comm_device=args.comm_device, lr=args.lr, momentum=args.momentum,
+        weight_decay=args.weight_decay, nesterov=args.nesterov,
+        verbose=args.verbose, num_peers=args.ppi_schedule[0],
+        network_interface_type=args.network_interface_type)
+
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.SGD(model.parameters(),
                                 lr=args.lr,
@@ -230,7 +195,6 @@ def main():
     # module used to relaunch jobs and handle external termination signals
     cmanager = ClusterManager(rank=args.rank,
                               world_size=args.world_size,
-                              bs_fname=args.bs_fpath,
                               model_tag=args.tag,
                               state=state,
                               all_workers=args.checkpoint_all)
@@ -303,10 +267,6 @@ def main():
         # deterministic seed used to load agent's subset of data
         sampler.set_epoch(epoch + args.seed * 90)
 
-        if not args.all_reduce and not args.bilat:
-            # update the model's peers_per_itr attribute
-            update_peers_per_itr(model, epoch)
-
         train(model, criterion, optimizer,
               batch_meter, data_meter, nn_meter,
               loader, epoch, start_itr, begin_time)
@@ -342,17 +302,12 @@ def main():
             model.block()
 
         epoch += 1
-        if args.bilat:
-            stopping_criterion = args.global_epoch >= args.num_epochs
-        else:
-            stopping_criterion = epoch >= args.num_epochs
+        stopping_criterion = args.global_epoch >= args.num_epochs
 
     if args.train_fast:
         val_loader = make_dataloader(args, train=False)
         prec1 = validate(val_loader, model, criterion)
         log.info('Test accuracy: {}'.format(prec1))
-
-    cmanager.halt = True
 
     log.info('elapsed_time {0}'.format(elapsed_time))
 
@@ -379,10 +334,7 @@ def train(model, criterion, optimizer, batch_meter, data_meter, nn_meter,
 
     log.debug('Training (epoch {})'.format(epoch))
 
-    if not args.bilat:
-        model.communicator_warmup()
-    if args.bilat:
-        model.enable_gossip()
+    model.enable_gossip()
 
     batch_time = time.time()
     for i, (batch, target) in enumerate(_train_loader, start=itr):
@@ -396,23 +348,22 @@ def train(model, criterion, optimizer, batch_meter, data_meter, nn_meter,
         nn_time = time.time()
         output = model(batch)
         loss = criterion(output, target)
-        if args.bilat:
-            bilat_freq = 100
-            if i == 0:
-                update_global_iteration_counter(itr=1,
-                                                itr_per_epoch=len(loader))
-                update_bilat_learning_rate(model, itr_per_epoch=len(loader))
-            elif (i + args.rank) % (bilat_freq) == 0:
-                update_global_iteration_counter(itr=bilat_freq,
-                                                itr_per_epoch=len(loader))
-                update_bilat_learning_rate(model, itr_per_epoch=len(loader))
+
+        bilat_freq = 100
+        if i == 0:
+            update_global_iteration_counter(itr=1,
+                                            itr_per_epoch=len(loader))
+            update_bilat_learning_rate(model, itr_per_epoch=len(loader))
+        elif (i + args.rank) % (bilat_freq) == 0:
+            update_global_iteration_counter(itr=bilat_freq,
+                                            itr_per_epoch=len(loader))
+            update_bilat_learning_rate(model, itr_per_epoch=len(loader))
+
         loss.backward()
         update_learning_rate(optimizer, epoch, itr=i,
                              itr_per_epoch=len(loader))
         optimizer.step()  # optimization update
         optimizer.zero_grad()
-        if not args.overlap and not args.bilat:
-            model.transfer_params()
         nn_meter.update(time.time() - nn_time)
         # ----------------------------------------------------------- #
 
@@ -426,8 +377,8 @@ def train(model, criterion, optimizer, batch_meter, data_meter, nn_meter,
         top1.update(prec1.item(), batch.size(0))
         top5.update(prec5.item(), batch.size(0))
         if i % args.print_freq == 0:
-            ep = epoch if not args.bilat else args.global_epoch
-            itr = i if not args.bilat else args.global_itr % (len(loader) * args.world_size)
+            ep = args.global_epoch
+            itr = args.global_itr % (len(loader) * args.world_size)
             with open(args.out_fname, '+a') as f:
                 print('{ep},{itr},{bt},{nt},{dt},'
                       '{loss.val:.4f},{loss.avg:.4f},'
@@ -463,8 +414,7 @@ def validate(val_loader, model, criterion):
     # switch to evaluate mode
     model.eval()
 
-    if args.bilat:
-        model.disable_gossip()
+    model.disable_gossip()
 
     with torch.no_grad():
         for i, (features, target) in enumerate(val_loader):
@@ -512,8 +462,6 @@ def update_state(state, update_dict):
 
 def update_peers_per_itr(model, epoch):
     """ Update the model's peers per itr according to specified schedule """
-    if args.single_threaded:
-        return
     ppi = None
     e_max = -1
     for e in args.ppi_schedule:
@@ -530,8 +478,6 @@ def update_bilat_learning_rate(model, itr_per_epoch=None, scale=1):
     ** note: args.lr is the reference learning rate from which to scale up
     ** note: minimum global batch-size is 256
     """
-    if not args.bilat:
-        return
     target_lr = args.lr * args.batch_size * scale * args.world_size / 256
     epoch = args.global_epoch
     itr_per_epoch *= args.world_size
@@ -558,8 +504,6 @@ def update_bilat_learning_rate(model, itr_per_epoch=None, scale=1):
 
 def update_global_iteration_counter(itr_per_epoch, itr=1):
     global args
-    if not args.bilat:
-        return
 
     p_str = ''
     for _ in range(itr):
@@ -570,7 +514,7 @@ def update_global_iteration_counter(itr_per_epoch, itr=1):
 
     # determine file length
     args.global_itr = int(os.stat(args.shared_fpath).st_size)
-    args.global_epoch = int(args.global_itr / (itr_per_epoch * args.world_size))
+    args.global_epoch = int(args.global_itr / itr_per_epoch / args.world_size)
     log.debug('global epoch estimate {}, global itr estimate {}'.format(
         args.global_epoch, args.global_itr))
 
@@ -584,11 +528,11 @@ def update_learning_rate(optimizer, epoch, itr=None, itr_per_epoch=None,
     ** note: minimum global batch-size is 256
     """
     target_lr = args.lr * args.batch_size * scale * args.world_size / 256
-    if args.bilat:
-        if args.global_itr is not None and args.global_epoch is not None:
-            epoch = args.global_epoch
-            itr_per_epoch *= args.world_size
-            itr = args.global_itr % itr_per_epoch
+
+    if args.global_itr is not None and args.global_epoch is not None:
+        epoch = args.global_epoch
+        itr_per_epoch *= args.world_size
+        itr = args.global_itr % itr_per_epoch
 
     lr = None
     if args.warmup and epoch < 5:  # warmup to scaled lr
@@ -614,8 +558,9 @@ def update_learning_rate(optimizer, epoch, itr=None, itr_per_epoch=None,
 def make_dataloader(args, train=True):
     """ Returns train/val distributed dataloaders (cf. ImageNet in 1hr) """
 
-    train_dir = TRAIN_DIR
-    val_dir = VAL_DIR
+    data_dir = args.dataset_dir
+    train_dir = os.path.join(data_dir, 'train')
+    val_dir = os.path.join(data_dir, 'val')
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
@@ -665,24 +610,18 @@ def parse_args():
         Master port <-- any free port (doesn't really matter)
     """
     args = parser.parse_args()
-    ClusterManager.set_user_name(args.user_name)
+    ClusterManager.set_checkpoint_dir(args.checkpoint_dir)
 
-    args.distributed = True if args.distributed == 'True' else False
-    if not args.distributed:
-        args.rank = 0
-        args.world_size = 1
-        args.device_id = 0
-        args.master_addr = 'localhost'
+    args.master_addr = os.environ['HOSTNAME']
+    if args.backend == 'mpi':
+        args.rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
+        args.world_size = int(os.environ['OMPI_UNIVERSE_SIZE'])
+        args.device_id = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
     else:
-        args.master_addr = os.environ['HOSTNAME']
-        if args.backend == 'mpi':
-            args.rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
-            args.world_size = int(os.environ['OMPI_UNIVERSE_SIZE'])
-            args.device_id = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
-        else:
-            args.rank = int(os.environ['SLURM_PROCID'])
-            args.world_size = int(os.environ['SLURM_NTASKS'])
-            args.device_id = int(os.environ['SLURM_LOCALID'])
+        args.rank = int(os.environ['SLURM_PROCID'])
+        args.world_size = int(os.environ['SLURM_NTASKS'])
+        args.device_id = int(os.environ['SLURM_LOCALID'])
+
     args.out_fname = ClusterManager.CHECKPOINT_DIR \
         + args.tag \
         + 'out_r' + str(args.rank) \
@@ -694,16 +633,18 @@ def parse_args():
     args.nesterov = True if args.nesterov == 'True' else False
     args.checkpoint_all = True if args.checkpoint_all == 'True' else False
     args.warmup = True if args.warmup == 'True' else False
-    args.cpu_comm = True if args.backend == 'tcp' else False
+    args.cpu_comm = True if args.backend == 'gloo' else False
     args.comm_device = torch.device('cpu') if args.cpu_comm else torch.device('cuda')
     args.overlap = True if args.overlap == 'True' else False
-    args.single_threaded = True if args.single_threaded == 'True' else False
-    args.data_preloaded = True if args.data_preloaded == 'True' else False
     args.push_sum = True if args.push_sum == 'True' else False
     args.all_reduce = True if args.all_reduce == 'True' else False
     args.bilat = True if args.bilat == 'True' else False
     args.global_epoch = None
     args.global_itr = None
+    if args.rank == 0 and os.path.isfile(args.shared_fpath):
+        os.remove(args.shared_fpath)
+    while os.path.isfile(args.shared_fpath):
+        pass
     args.lr_schedule = {}
     if args.schedule is None:
         args.schedule = [30, 0.1, 60, 0.1, 80, 0.1]
@@ -730,18 +671,35 @@ def parse_args():
     del args.peers_per_itr_schedule
     # must specify how many peers to communicate from the start of training
     assert 0 in args.ppi_schedule
-    if args.distributed:
-        try:
-            args.graph = GRAPH_TOPOLOGIES[args.graph_type](
-                args.rank, args.world_size, peers_per_itr=args.ppi_schedule[0])
-        except Exception:
-            args.graph = None
-        try:
-            args.mixing = MIXING_STRATEGIES[args.mixing_strategy](args.graph)
-        except Exception:
-            args.mixing = None
-    else:
-        args.graph, args.mixing = None, None
+
+    if args.backend == 'gloo':
+        assert args.network_interface_type == 'ethernet'
+        os.environ['GLOO_SOCKET_IFNAME'] = get_tcp_interface_name(
+            network_interface_type=args.network_interface_type
+        )
+    elif args.network_interface_type == 'ethernet':
+        if args.backend == 'nccl':
+            os.environ['NCCL_SOCKET_IFNAME'] = get_tcp_interface_name(
+                network_interface_type=args.network_interface_type
+            )
+            os.environ['NCCL_IB_DISABLE'] = '1'
+        else:
+            raise NotImplementedError
+
+    # initialize torch distributed backend
+    os.environ['MASTER_ADDR'] = args.master_addr
+    os.environ['MASTER_PORT'] = str(int(args.master_port) + 1)
+    dist.init_process_group(backend=args.backend,
+                            world_size=args.world_size,
+                            rank=args.rank)
+
+    args.graph_class = GRAPH_TOPOLOGIES[args.graph_type]
+    args.mixing_class = MIXING_STRATEGIES[args.mixing_strategy]
+
+    if args.graph_class is None:
+        raise Exception('Incorrect arguments for graph_type')
+    if args.mixing_class is None:
+        raise Exception('Incorrect arguments for mixing_strategy')
 
     return args
 

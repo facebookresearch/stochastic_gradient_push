@@ -28,23 +28,21 @@ from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import scatter_kwargs, gather
 from torch.nn.parallel.parallel_apply import parallel_apply
 
+from experiment_utils import get_tcp_interface_name
 from .gossiper import BilatPushPull
-from .utils import make_logger, _flatten_tensors, _unflatten_tensors
+from .utils import make_logger, flatten_tensors, unflatten_tensors
 from .utils.metering import Meter
 
 
 class BilatGossipDataParallel(Module):
     """ Distributed Gossip model wrapper """
 
-    def __init__(self, module, device_ids=None, distributed=True,
-                 master_addr=None, master_port=None, backend=None,
-                 world_size=None, rank=None, graph=None, mixing=None,
+    def __init__(self, module, device_ids=None, master_addr=None,
+                 master_port=None, backend=None, world_size=None, rank=None,
+                 graph_class=None, mixing_class=None, num_peers=1,
                  comm_device=None, lr=0.1, momentum=0.9, weight_decay=1e-4,
-                 nesterov=True, verbose=True):
+                 nesterov=True, verbose=True, network_interface_type=None):
         super(BilatGossipDataParallel, self).__init__()
-
-        # whether we're using multiple agents for training
-        self.distributed = distributed
 
         # devices available locally
         if device_ids is None:
@@ -70,76 +68,72 @@ class BilatGossipDataParallel(Module):
         else:
             self._module_copies = [self.module]
 
-        # prepare inter-node gossip objects
-        if self.distributed:
+        # communicate over cpu's if not specified
+        if comm_device is None:
+            comm_device = torch.device('cpu')
+        self.__cpu_comm = comm_device.type == 'cpu'
 
-            # communicate over cpu's if not specified
-            if comm_device is None:
-                comm_device = torch.device('cpu')
-            self.__cpu_comm = comm_device.type == 'cpu'
+        # distributed backend config
+        self.dist_config = {
+            'verbose': verbose,
+            'graph_class': graph_class,
+            'master_addr': master_addr,
+            'master_port': master_port,
+            'backend': backend,
+            'world_size': world_size,
+            'rank': rank,
+            'mixing_class': mixing_class,
+            'lr': lr,
+            'momentum': momentum,
+            'nesterov': nesterov,
+            'weight_decay': weight_decay,
+            'comm_device': comm_device,
+            'network_interface_type': network_interface_type,
+            'num_peers': num_peers
+        }
+        self.num_updates = 0
 
-            # distributed backend config
-            self.dist_config = {
-                'verbose': verbose,
-                'graph': graph,
-                'master_addr': master_addr,
-                'master_port': master_port,
-                'backend': backend,
-                'world_size': world_size,
-                'rank': rank,
-                'mixing': mixing,
-                'lr': lr,
-                'momentum': momentum,
-                'nesterov': nesterov,
-                'weight_decay': weight_decay
-            }
-            self.num_updates = 0
+        # logger used to print to stdout
+        self.logger = make_logger(rank, verbose)
 
-            # logger used to print to stdout
-            self.logger = make_logger(rank, verbose)
+        # prepare parameters for gossip
+        self.gossip_enable = True
+        self.gossip_params = []
+        self.gossip_grads = []
+        for p in module.parameters():
+            cp = p.clone().detach_()
+            cp = cp.cpu().pin_memory() if self.__cpu_comm else cp.cuda()
+            cp.requires_grad = p.requires_grad
+            self.gossip_params.append(cp)
+            if p.requires_grad:
+                g = cp.clone().zero_().detach_()
+                g = g.cpu().pin_memory() if self.__cpu_comm else g.cuda()
+                self.gossip_grads.append(g)
 
-            # prepare parameters for gossip
-            self.gossip_enable = True
-            self.gossip_params = []
-            self.gossip_grads = []
-            for p in module.parameters():
-                cp = p.clone().detach_()
-                cp = cp.cpu().pin_memory() if self.__cpu_comm else cp.cuda()
-                cp.requires_grad = p.requires_grad
-                self.gossip_params.append(cp)
-                if p.requires_grad:
-                    g = cp.clone().zero_().detach_()
-                    g = g.cpu().pin_memory() if self.__cpu_comm else g.cuda()
-                    self.gossip_grads.append(g)
+        self.gossip_queue = mp.Queue()
+        self.gossip_lock = mp.Lock()
+        self.gossip_enable_flag = mp.Event()
+        self.train_write_flag = mp.Event()  # signal train-proc write event
+        self.gossip_read_flag = mp.Event()  # signal gossip-proc read event
+        self.gossip_update_flag = mp.Event()  # signal 2 gossip-proc need update
+        self._lr = mp.Value('f', lr, lock=self.gossip_lock)
+        self.gossip_thread = mp.Process(
+            target=BilatGossipDataParallel._gossip_target,
+            args=(self.dist_config,
+                  self.gossip_enable_flag,
+                  self.train_write_flag,
+                  self.gossip_read_flag,
+                  self.gossip_update_flag,
+                  self._lr,
+                  self.gossip_lock,
+                  self.gossip_queue))
+        self.gossip_thread.daemon = True
+        self.gossip_thread.name = 'Gossip-Thread'
+        self.gossip_thread.start()
 
-            self.gossip_queue = mp.Queue()
-            self.gossip_lock = mp.Lock()
-            self.gossip_enable_flag = mp.Event()
-            self.train_write_flag = mp.Event()  # signal train-proc write event
-            self.gossip_read_flag = mp.Event()  # signal gossip-proc read event
-            self.gossip_update_flag = mp.Event()  # signal 2 gossip-proc need update
-            self._lr = mp.Value('f', lr, lock=self.gossip_lock)
-            self.gossip_thread = mp.Process(
-                target=BilatGossipDataParallel._gossip_target,
-                args=(self.dist_config,
-                      self.gossip_enable_flag,
-                      self.train_write_flag,
-                      self.gossip_read_flag,
-                      self.gossip_update_flag,
-                      self._lr,
-                      self.gossip_lock,
-                      self.gossip_queue))
-            self.gossip_thread.daemon = True
-            self.gossip_thread.name = 'Gossip-Thread'
-            self.gossip_thread.start()
-
-            # pass handle to gossip_params and gossip_grads, and put in shared
-            # memory
-            self.gossip_queue.put((self.gossip_params, self.gossip_grads))
-
-        else:
-            # logger used to print to stdout
-            self.logger = make_logger(0, verbose)
+        # pass handle to gossip_params and gossip_grads, and put in shared
+        # memory
+        self.gossip_queue.put((self.gossip_params, self.gossip_grads))
 
         # register ps/grad-reduction hooks
         self.__register_hooks()
@@ -174,7 +168,7 @@ class BilatGossipDataParallel(Module):
         return gather(outputs, output_device, dim=0)
 
     def _sync_params(self):
-        """ Synchronoize parameters across devices (intra-node) """
+        """ Synchronize parameters across devices (intra-node) """
         if len(self.device_ids) <= 1:
             return
 
@@ -187,12 +181,12 @@ class BilatGossipDataParallel(Module):
                 param.data.set_(tensor)
 
         # intra-node buffer sync
-        buffers = [b.data for b in self.module._all_buffers()]
+        buffers = [b.data for b in self.module.buffers()]
         if len(buffers) > 0:
             result = broadcast_coalesced(buffers, self.device_ids,
                                          self.broadcast_bucket_size)
             for tensors, module in zip(result[1:], self._module_copies[1:]):
-                for tensor, buf in zip(tensors, module._all_buffers()):
+                for tensor, buf in zip(tensors, module.buffers()):
                     buf.data.set_(tensor)
 
     def train(self, mode=True):
@@ -204,37 +198,26 @@ class BilatGossipDataParallel(Module):
         super(BilatGossipDataParallel, self).eval()
         for module in self._module_copies[1:]:
             module.eval()
-        if self.distributed:
-            self._pull_model()
+        self._pull_model()
 
     def enable_gossip(self):
-        if not self.distributed:
-            return
         self.gossip_enable = True
         self.gossip_enable_flag.set()
 
     def disable_gossip(self):
-        if not self.distributed:
-            return
         self.gossip_enable = False
         self.gossip_enable_flag.clear()
 
     def block(self):
         return
-        if not self.distributed:
-            return
         self.logger.info('blocking')
         dist.barrier()
 
     def sync_comms(self):
-        if not self.distributed:
-            return
         self._pull_model()
 
     def _pull_model(self):
         """ Pull model from gossip thread """
-        if not self.distributed:
-            return
 
         # pull model from gossip thread
         with self.gossip_lock:
@@ -247,9 +230,6 @@ class BilatGossipDataParallel(Module):
 
     def _transfer_grads(self):
         """ Transfers copy of grads to gossip thread """
-        if not self.distributed:
-            return False
-
         self.logger.debug('transfering model grads')
 
         # don't transfer new grads until old grads have been transferred
@@ -284,6 +264,21 @@ class BilatGossipDataParallel(Module):
                 weight_decay=dist_config['weight_decay'],
                 nesterov=dist_config['nesterov'])
 
+            if dist_config['backend'] == 'gloo':
+                assert dist_config['network_interface_type'] == 'ethernet'
+            elif dist_config['network_interface_type'] == 'ethernet':
+                if dist_config['backend'] == 'nccl':
+                    os.environ['NCCL_SOCKET_IFNAME'] = get_tcp_interface_name(
+                        network_interface_type=dist_config['network_interface_type']
+                    )
+                    os.environ['NCCL_IB_DISABLE'] = '1'
+                elif dist_config['backend'] == 'gloo':
+                    os.environ['GLOO_SOCKET_IFNAME'] = get_tcp_interface_name(
+                        network_interface_type=dist_config['network_interface_type']
+                    )
+                else:
+                    raise NotImplementedError
+
             # initialize torch distributed backend
             os.environ['MASTER_ADDR'] = dist_config['master_addr']
             os.environ['MASTER_PORT'] = dist_config['master_port']
@@ -296,15 +291,32 @@ class BilatGossipDataParallel(Module):
                 gossip_params[0].norm(), gossip_grads[0].norm()))
 
             # init gossip instance
-            gossiper = BilatPushPull(_flatten_tensors(gossip_params),
-                                     graph=dist_config['graph'],
-                                     mixing=dist_config['mixing'],
+            graph_class = dist_config['graph_class']
+            mixing_class = dist_config['mixing_class']
+
+            if graph_class:
+                # dist.barrier is done here to ensure the NCCL communicator is
+                # created here. This prevents an error which may be caused if
+                # the NCCL # communicator is created at a time gap of more
+                # than 5 minutes in different processes
+                dist.barrier()
+                graph = graph_class(
+                    dist_config['rank'], dist_config['world_size'],
+                    peers_per_itr=dist_config['num_peers'])
+            if mixing_class and graph:
+                mixing = mixing_class(graph, dist_config['comm_device'])
+
+            gossiper = BilatPushPull(flatten_tensors(gossip_params),
+                                     graph=graph,
+                                     mixing=mixing,
                                      logger=logger)
+
             dist_config['graph'] = gossiper._graph_manager
             dist_config['mixing'] = gossiper._mixing_manager
             dist_config['gossiper'] = gossiper
             model_meter = Meter(ptag='Model', stateful=True, csv_format=False)
-            gossip_meter = Meter(ptag='Gossip', stateful=True, csv_format=False)
+            gossip_meter = Meter(
+                ptag='Gossip', stateful=True, csv_format=False)
             gossip_read_flag.set()
 
             # gossip loop
@@ -339,15 +351,17 @@ class BilatGossipDataParallel(Module):
                     # construct gossip tensor
                     bt = time.time()
                     with gossip_lock:
-                        out_msg = _flatten_tensors(gossip_params)
+                        out_msg = flatten_tensors(gossip_params).to(
+                            dist_config['comm_device'])
                     # gossip step
                     in_msg, completed = gossiper.mix(out_msg)
                     # update gossip params (local model)
                     if completed:
                         with gossip_lock:
-                            for p, g in zip(gossip_params,
-                                            _unflatten_tensors(in_msg, gossip_params)):
-                                p.data.add_(g).mul_(0.5)
+                            for p, g in zip(
+                                    gossip_params, unflatten_tensors(
+                                        in_msg, gossip_params)):
+                                p.data.add_(g.to(p.device)).mul_(0.5)
                     gossip_meter.update(time.time() - bt)
                     logger.debug(gossip_meter)
                 except RuntimeError as e:
@@ -393,9 +407,8 @@ class BilatGossipDataParallel(Module):
                             param.data.set_()
 
             # convert model back to ps-numerator
-            if self.distributed:
-                self._transfer_grads()
-                self._pull_model()
+            self._transfer_grads()
+            self._pull_model()
 
         def queue_hook(*unused):
             Variable._execution_engine.queue_callback(hook)
@@ -403,8 +416,6 @@ class BilatGossipDataParallel(Module):
 
     def communicator_warmup(self):
         """ time the all-reducde code """
-        if not self.distributed:
-            return
         dist.barrier()
         time.sleep(5)
         dist.barrier()

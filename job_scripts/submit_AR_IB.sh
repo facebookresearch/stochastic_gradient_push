@@ -18,9 +18,10 @@
 # Load any modules and activate your conda environment here
 
 srun python -u gossip_sgd.py \
-    --batch_size 256 --distributed True --lr 0.1 --num_dataloader_workers 16 \
+    --batch_size 256 --lr 0.1 --num_dataloader_workers 16 \
     --num_epochs 90 --nesterov True --warmup True --push_sum False \
-    --graph_type 4 --schedule 30 0.1 60 0.1 80 0.1 --backend 'gloo'  \
+    --schedule 30 0.1 60 0.1 80 0.1 \
     --train_fast False --master_port 40100 \
-    --tag 'AR-SGD_IB' --print_freq 100 --verbose False \
-    --single_threaded False --overlap False --all_reduce True
+    --tag 'AR-SGD-IB' --print_freq 100 --verbose False \
+    --graph_type -1 --all_reduce True --seed 1 \
+    --network_interface_type 'infiniband'

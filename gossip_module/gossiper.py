@@ -16,7 +16,6 @@ import torch
 import torch.distributed as dist
 
 from .graph_manager import GraphManager
-from .graph_manager import DynamicBipartiteExponentialGraph as DBEGraph
 from .mixing_manager import MixingManager
 from .mixing_manager import UniformMixing
 
@@ -32,7 +31,7 @@ class dist_backend:
 class Gossiper(object):
     """ Generic gossip averaging object for multi-peer communication """
 
-    def __init__(self, msg, device=None, graph=None, mixing=None, logger=None,
+    def __init__(self, msg, graph, device=None, mixing=None, logger=None,
                  rank=None, world_size=None):
         """
         Initialize generic averaging class designed for multi-peer comms
@@ -56,16 +55,17 @@ class Gossiper(object):
         # graph topology properties
         self.rank = rank
         self.world_size = world_size
-        if graph is None:
-            graph = DBEGraph(self.rank, self.world_size, peers_per_itr=1)
         assert isinstance(graph, GraphManager)
         self._graph_manager = graph
+        self.peers_per_itr_device = torch.tensor(
+            [self._graph_manager.peers_per_itr], device=device,
+            dtype=msg.dtype)
         self.passive = self._graph_manager.is_passive()
         self.refresh_peers_(rotate=False)  # sets in- and out-peers attributes
 
         # mixing matrix
         if mixing is None:
-            mixing = UniformMixing(self._graph_manager)
+            mixing = UniformMixing(self._graph_manager, device)
         assert isinstance(mixing, MixingManager)
         self._mixing_manager = mixing
         self.refresh_mixing_weights_()  # sets mixing-weights attribute
@@ -77,7 +77,8 @@ class Gossiper(object):
         self.device = device if device is not None else msg.device
         self.out_msg_buffer = []
         self.in_msg_buffer = msg.clone().detach_().to(self.device)
-        self._ps_weight = torch.ones(1).detach_().to(self.device)
+        self._ps_weight = torch.ones(1).detach_().to(self.device).type(
+            msg.dtype)
         # not using regular comms ==> need to communicate ps-weight
         if not self.regular:
             self.in_msg_buffer = torch.cat([self.in_msg_buffer,
@@ -89,6 +90,8 @@ class Gossiper(object):
                 if self.logger is not None:
                     self.logger.error(e)
         self.placeholder = self.in_msg_buffer.clone()
+
+        self._pending_req = None
 
     @property
     def ps_weight(self):
@@ -112,7 +115,7 @@ class Gossiper(object):
             rotate = True if self._graph_manager.is_dynamic_graph() else False
         # cannot cycle peers in a static graph
         assert not (rotate and not self._graph_manager.is_dynamic_graph())
-        self.out_peers, self.in_peers = self._graph_manager.get_peers(rotate)
+        self.out_edges, self.in_edges = self._graph_manager.get_edges(rotate)
 
     def refresh_mixing_weights_(self, residual_adjusted=False):
         """ Update mixing-matrix weights """
@@ -126,25 +129,22 @@ class Gossiper(object):
 
         # check whether or not we need to communicate ps_weight
         if not self.regular:
-            out_msg = torch.cat([out_msg, self.ps_weight])
+            out_msg = torch.cat([out_msg, self.ps_weight.type(out_msg.dtype)])
 
         # first return 'loopback msg to self'
         if not residual:
-            yield out_msg.mul(self.mixing_weights['lo'])
+            yield out_msg.mul(self.mixing_weights['lo'].type(out_msg.dtype))
 
         # check whether or not we need to create a buffer for each out-msg
         if self._mixing_manager.is_uniform():
             weight = self.mixing_weights['uniform']
-            out_msg = out_msg if weight == 1. else out_msg.mul(weight)
-            for op in self.out_peers:
+            out_msg *= weight.type(out_msg.dtype)
+            for _ in self.out_edges:
                 yield out_msg
         else:
-            for op in self.out_peers:
-                weight = self.mixing_weights[op]
-                if weight == 1.:
-                    yield out_msg
-                else:
-                    yield out_msg.mul(weight)
+            for out_edge in self.out_edges:
+                weight = self.mixing_weights[out_edge.dest]
+                yield out_msg.mul(weight.type(out_msg.dtype))
 
     def clean_msg_buffers_(self):
         """ Clean outgoing message buffer """
@@ -161,12 +161,12 @@ class Gossiper(object):
         """ Parse in-msg buffer and return msg and ps-weight separately """
         msg = self.in_msg_buffer
         if not self.regular:
-            return msg.narrow(0, 0, len(msg) - 1), msg[-1].item()
+            return msg.narrow(0, 0, len(msg) - 1), msg[-1]
         else:
             if residual:
-                return msg, self.ps_weight.item() * self.peers_per_itr
+                return msg, self.ps_weight * self.peers_per_itr_device
             else:
-                return msg, 1.
+                return msg, torch.ones(1, device=self.device).type(msg.dtype)
 
     def mix(self):
         """ Single gossip step """
@@ -182,21 +182,24 @@ class PushSum(Gossiper):
         assert out_msg.device.type == self.device.type
         if self.logger is not None:
             self.logger.debug('in/out -peers {}/{}'
-                              .format(self.in_peers, self.out_peers))
+                              .format(self.in_edges, self.out_edges))
 
         # prepare messages for gossip
         mixed_out_msgs = self.mix_out_msg_(out_msg, ps_weight, residual)
 
         # non-blocking send
-        for op in self.out_peers:
+        for out_edge in self.out_edges:
             msg = next(mixed_out_msgs)
-            req = dist.isend(tensor=msg, dst=op)
+            assert self.rank == out_edge.src
+            req = dist.broadcast(tensor=msg, src=out_edge.src,
+                                 group=out_edge.process_group, async_op=True)
             self.out_msg_buffer.append((req, msg))
 
         # blocking recv w/ some code optimization to avoid buffer prep overhead
-        if len(self.in_peers) == 1 and residual:
-            ip = self.in_peers[0]
-            dist.recv(tensor=self.in_msg_buffer, src=ip)
+        if len(self.in_edges) == 1 and residual:
+            in_edge = self.in_edges[0]
+            dist.broadcast(tensor=self.in_msg_buffer, src=in_edge.src,
+                           group=in_edge.process_group)
 
         # regular non-blocking recv
         else:
@@ -206,8 +209,9 @@ class PushSum(Gossiper):
             else:
                 self.in_msg_buffer.zero_()
 
-            for ip in self.in_peers:
-                dist.recv(tensor=self.placeholder, src=ip)
+            for in_edge in self.in_edges:
+                dist.broadcast(tensor=self.placeholder, src=in_edge.src,
+                               group=in_edge.process_group)
                 self.in_msg_buffer.add_(self.placeholder)
 
         self.refresh_peers_()
@@ -223,21 +227,25 @@ class PushPull(Gossiper):
         assert out_msg.device.type == self.device.type
         if self.logger is not None:
             self.logger.debug('in/out -peers {}/{}'
-                              .format(self.in_peers, self.out_peers))
+                              .format(self.in_edges, self.out_edges))
 
         # prepare messages for gossip
         mixed_out_msgs = self.mix_out_msg_(out_msg, ps_weight, residual)
 
         # send-recv w/ some code optimization to avoid buffer prep overhead
-        if len(self.in_peers) == 1 and len(self.out_peers) == 1 and residual:
-            op, ip = self.out_peers[0], self.in_peers[0]
+        if len(self.in_edges) == 1 and len(self.out_edges) == 1 and residual:
+            out_edge, in_edge = self.out_edges[0], self.in_edges[0]
             msg = next(mixed_out_msgs)
             if not self.passive:
-                dist.send(tensor=msg, dst=op)
-                dist.recv(tensor=self.in_msg_buffer, src=ip)
+                dist.broadcast(tensor=msg, src=out_edge.src,
+                               group=out_edge.process_group)
+                dist.broadcast(tensor=self.in_msg_buffer, src=in_edge.src,
+                               group=in_edge.process_group)
             else:
-                dist.recv(tensor=self.in_msg_buffer, src=ip)
-                dist.send(tensor=msg, dst=op)
+                dist.broadcast(tensor=self.in_msg_buffer, src=in_edge.src,
+                               group=in_edge.process_group)
+                dist.broadcast(tensor=msg, src=out_edge.src,
+                               group=out_edge.process_group)
 
         # regular send-recv
         else:
@@ -248,16 +256,68 @@ class PushPull(Gossiper):
                 self.in_msg_buffer.zero_()
 
             # send-recv
-            for op, ip in zip(self.out_peers, self.in_peers):
+            for out_edge, in_edge in zip(self.out_edges, self.in_edges):
                 msg = next(mixed_out_msgs)
                 if not self.passive:
-                    dist.send(tensor=msg, dst=op)
-                    dist.recv(tensor=self.placeholder, src=ip)
+                    dist.broadcast(tensor=msg, src=out_edge.src,
+                                   group=out_edge.process_group)
+                    dist.broadcast(tensor=self.placeholder, src=in_edge.src,
+                                   group=in_edge.process_group)
                 else:
-                    dist.recv(tensor=self.placeholder, src=ip)
-                    dist.send(tensor=msg, dst=op)
+                    dist.broadcast(tensor=self.placeholder, src=in_edge.src,
+                                   group=in_edge.process_group)
+                    dist.broadcast(tensor=msg, src=out_edge.src,
+                                   group=out_edge.process_group)
                 self.in_msg_buffer.add_(self.placeholder)
 
         self.refresh_peers_()
         self.clean_msg_buffers_()
         return self.parse_in_msg_buffer(residual)
+
+
+class BilatPushPull(Gossiper):
+    """ Bilateral doubly-stochastic consensus averaging module """
+
+    def mix(self, out_msg):
+        # out_msg must be on the correct device
+        assert out_msg.device.type == self.device.type
+        # bilat gossip can only send and receive from one peer at each itr
+        assert len(self.in_edges) == 1 and len(self.out_edges) == 1
+        out_edge, in_edge = self.out_edges[0], self.in_edges[0]
+        if self.logger is not None:
+            self.logger.debug('in/out -edges {}/{}'.format(in_edge, out_edge))
+
+        if not self.passive:
+            # prepare messages for gossip
+            mixed_out_msgs = self.mix_out_msg_(out_msg, 1., residual=True)
+            msg = next(mixed_out_msgs)
+            # blocking send/recv
+            dist.broadcast(tensor=msg, src=out_edge.src,
+                           group=out_edge.process_group)
+            dist.broadcast(tensor=self.in_msg_buffer, src=in_edge.src,
+                           group=in_edge.process_group)
+            completed = True
+        else:
+            if self._pending_req is None:
+                self._pending_req = dist.broadcast(
+                    tensor=self.in_msg_buffer, src=in_edge.src,
+                    group=in_edge.process_group, async_op=True)
+            if self._pending_req.is_completed():
+                # prepare messages for gossip
+                mixed_out_msgs = self.mix_out_msg_(out_msg, 1., residual=True)
+                msg = next(mixed_out_msgs)
+                if self.logger is not None:
+                    self.logger.debug('req. completed; sending to {}'.format(out_edge))
+                dist.broadcast(tensor=msg, src=out_edge.src,
+                               group=out_edge.process_group)
+                self._pending_req = None
+                completed = True
+            else:
+                completed = False
+
+        if completed:
+            self.refresh_peers_()
+            self.clean_msg_buffers_()
+            return self.parse_in_msg_buffer(residual=True)
+
+        return out_msg, completed
