@@ -7,7 +7,7 @@ Code to reproduce the experiments reported in the paper:
 If you use this code for your research, please cite the paper.
 
 It implements the following algorithms:
-* Synchronus Stochastic Gradient Push (SGP), described in the paper
+* Synchronous Stochastic Gradient Push (SGP), described in the paper
 * Overlap Stochastic Gradient Push (OSGP), described in the paper
 * AllReduce SGD (AR), standard baseline, also known as Parallel SGD
 * Distributed Parallel SGD (D-PSGD), described in [Lian et al., NeurIPS 2017](https://arxiv.org/abs/1705.09056)
