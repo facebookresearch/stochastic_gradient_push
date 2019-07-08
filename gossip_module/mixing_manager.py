@@ -13,10 +13,14 @@ Mixing Manager Class
 """
 
 
+import torch
+
+
 class MixingManager(object):
 
-    def __init__(self, graph):
+    def __init__(self, graph, device):
         self.graph_manager = graph
+        self.device = device
 
     def is_regular(self):
         """
@@ -41,12 +45,12 @@ class UniformMixing(MixingManager):
         mixing_weights = {}
         out_peers, _ = self.graph_manager.get_peers()
 
-        w = 1. / (len(out_peers) + 1.)
-        mixing_weights['lo'] = w
+        w = torch.tensor([1. / (len(out_peers) + 1.)], device=self.device)
+        mixing_weights['lo'] = w.clone()
         w_op = w if not residual_adjusted else w / mixing_weights['lo']
-        mixing_weights['uniform'] = w_op
+        mixing_weights['uniform'] = w_op.clone()
         for op in out_peers:
-            mixing_weights[op] = w_op
+            mixing_weights[op] = w_op.clone()
         return mixing_weights
 
     def is_uniform(self): return True

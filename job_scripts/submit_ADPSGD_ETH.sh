@@ -18,10 +18,10 @@
 # Load any modules and activate your conda environment here
 
 srun python -u gossip_sgd_adpsgd.py \
-    --batch_size 256 --distributed True --lr 0.1 --num_dataloader_workers 16 \
+    --batch_size 256 --lr 0.1 --num_dataloader_workers 16 \
     --num_epochs 90 --nesterov True --warmup True --push_sum False \
-    --graph_type 1 --schedule 30 0.1 60 0.1 80 0.1 --backend 'tcp'  \
-    --train_fast True --master_port 40100 \
-    --tag 'ADPSGD_ETH' --print_freq 50 --verbose True --bilat True \
-    --single_threaded False --overlap False --all_reduce False \
+    --graph_type 1 --schedule 30 0.1 60 0.1 80 0.1 \
+    --train_fast True --master_port 40100 --network_interface_type 'ethernet' \
+    --tag 'ADPSGD_ETH' --print_freq 100 --verbose False --bilat True \
+    --all_reduce False --seed 1 \
     --shared_fpath 'results_dir/itr32.txt'
