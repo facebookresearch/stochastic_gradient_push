@@ -20,6 +20,8 @@ All code runs on Python 3.6.7 using [PyTorch version 1.0.0](https://github.com/p
 
 Our implementations build on the `torch.distributed` package in PyTorch, which provides an interface for exchanging tensors between multiple machines. The `torch.distributed` package in PyTorch v.1.0.0 can use different backends. We recommmend using NCCL for all algorithms (this is the default).
 
+* You could run `./scripts/setup.sh` to install all the dependencies. You may have to change the CUDA version etc  (in the `requirements.txt` file) to match your setup.
+
 In addition, you will need to install
 * [torchvision 0.2.1](https://github.com/pytorch/vision/tree/v0.2.1) for the ResNet-50 model
 * matplotlib 2.2.2 for producing figures
