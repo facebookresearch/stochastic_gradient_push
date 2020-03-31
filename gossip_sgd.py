@@ -45,14 +45,14 @@ from experiment_utils import make_logger
 from experiment_utils import Meter
 from experiment_utils import ClusterManager
 from experiment_utils import get_tcp_interface_name
-from gossip_module import GossipDataParallel
-from gossip_module import DynamicBipartiteExponentialGraph as DBEGraph
-from gossip_module import DynamicBipartiteLinearGraph as DBLGraph
-from gossip_module import DynamicDirectedExponentialGraph as DDEGraph
-from gossip_module import DynamicDirectedLinearGraph as DDLGraph
-from gossip_module import NPeerDynamicDirectedExponentialGraph as NPDDEGraph
-from gossip_module import RingGraph
-from gossip_module import UniformMixing
+from gossip import GossipDataParallel
+from gossip import DynamicBipartiteExponentialGraph as DBEGraph
+from gossip import DynamicBipartiteLinearGraph as DBLGraph
+from gossip import DynamicDirectedExponentialGraph as DDEGraph
+from gossip import DynamicDirectedLinearGraph as DDLGraph
+from gossip import NPeerDynamicDirectedExponentialGraph as NPDDEGraph
+from gossip import RingGraph
+from gossip import UniformMixing
 
 GRAPH_TOPOLOGIES = {
     0: DDEGraph,    # Dynamic Directed Exponential
@@ -101,12 +101,12 @@ parser.add_argument('--push_sum', default='True', type=str,
 parser.add_argument('--graph_type', default=5, type=int,
                     choices=GRAPH_TOPOLOGIES,
                     help='the graph topology to use for gossip'
-                         'cf. the gossip_module graph_manager for available'
+                         'cf. the gossip graph_manager for available'
                          'graph topologies and their corresponding int-id')
 parser.add_argument('--mixing_strategy', default=0, type=int,
                     choices=MIXING_STRATEGIES,
                     help='the mixing strategy to use for gossip'
-                         'cf. the gossip_module mixing_manager for available'
+                         'cf. the gossip mixing_manager for available'
                          'mixing strategies and their corresponding int-id.')
 parser.add_argument('--schedule', nargs='+', default='30 0.1 60 0.1 80 0.1',
                     type=float, help='learning rate schedule')

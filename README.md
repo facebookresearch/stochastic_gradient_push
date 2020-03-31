@@ -56,12 +56,12 @@ Figures similar to those in the paper can be reproduced, after running the exper
 
 ## Overview of the implementation, code organization
 ### Training neural networks
-The algorithms SGP, D-PSGD, and AD-PSGD are all implemented as instances of PyTorch's `nn.Module` class to facilitate training neural network models. SGP and D-PSGD are implemented in the `GossipDataParallel` class in `gossip_modules/distributed.py`. The `push_sum` argument determines whether to use SGP (if `push_sum=True`) or D-PSGD (if `push_sum=False`). Overlap SGP is obtained by using the `GossipDataParallel` class with `push_sum=True` and `overlap=True`. AD-PSGD is implemented in the `BilatGossipDataParallel` class in `gossip_modules/ad_psgd.py`
+The algorithms SGP, D-PSGD, and AD-PSGD are all implemented as instances of PyTorch's `nn.Module` class to facilitate training neural network models. SGP and D-PSGD are implemented in the `GossipDataParallel` class in `gossip/distributed.py`. The `push_sum` argument determines whether to use SGP (if `push_sum=True`) or D-PSGD (if `push_sum=False`). Overlap SGP is obtained by using the `GossipDataParallel` class with `push_sum=True` and `overlap=True`. AD-PSGD is implemented in the `BilatGossipDataParallel` class in `gossip/ad_psgd.py`
 
 ### Gossip-based distributed averaging
-The neural network modules use implementations of PushSum and gossip algorithms for distributed averaging under the hood. These are availble in `gossip_modules/gossiper.py` and could be used independently of neural network training for approximate distributed averaging. In addition:
-* `gossip_modules/graph_manager.py` contains code to generate different communication topologies, and
-* `gossip_modules/mixing_manager.py` contains code to produce weights of the mixing matrices, given a topology.
+The neural network modules use implementations of PushSum and gossip algorithms for distributed averaging under the hood. These are availble in `gossip/gossiper.py` and could be used independently of neural network training for approximate distributed averaging. In addition:
+* `gossip/graph_manager.py` contains code to generate different communication topologies, and
+* `gossip/mixing_manager.py` contains code to produce weights of the mixing matrices, given a topology.
 
 ## License
 See the [LICENSE](./LICENSE) file for details about the license under which this code is made available.
