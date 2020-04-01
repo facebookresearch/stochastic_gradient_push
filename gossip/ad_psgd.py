@@ -28,7 +28,7 @@ from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import scatter_kwargs, gather
 from torch.nn.parallel.parallel_apply import parallel_apply
 
-from experiment_utils import get_tcp_interface_name
+from .utils import get_tcp_interface_name
 from .gossiper import BilatPushPull
 from .utils import make_logger, flatten_tensors, unflatten_tensors
 from .utils.metering import Meter
