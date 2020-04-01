@@ -39,14 +39,14 @@ from experiment_utils import get_tcp_interface_name
 from experiment_utils import make_logger
 from experiment_utils import Meter
 from experiment_utils import ClusterManager
-from gossip_module import BilatGossipDataParallel
-from gossip_module import DynamicDirectedExponentialGraph as DDEGraph
-from gossip_module import DynamicBipartiteExponentialGraph as DBEGraph
-from gossip_module import DynamicDirectedLinearGraph as DDLGraph
-from gossip_module import DynamicBipartiteLinearGraph as DBLGraph
-from gossip_module import NPeerDynamicDirectedExponentialGraph as NPDDEGraph
-from gossip_module import RingGraph
-from gossip_module import UniformMixing
+from gossip import BilatGossipDataParallel
+from gossip import DynamicDirectedExponentialGraph as DDEGraph
+from gossip import DynamicBipartiteExponentialGraph as DBEGraph
+from gossip import DynamicDirectedLinearGraph as DDLGraph
+from gossip import DynamicBipartiteLinearGraph as DBLGraph
+from gossip import NPeerDynamicDirectedExponentialGraph as NPDDEGraph
+from gossip import RingGraph
+from gossip import UniformMixing
 
 GRAPH_TOPOLOGIES = {
     0: DDEGraph,    # Dynamic Directed Exponential
@@ -92,11 +92,11 @@ parser.add_argument('--push_sum', default='True', type=str,
                     help='whether to use push-sum or push-pull gossip')
 parser.add_argument('--graph_type', default=0, type=int,
                     help='the graph topology to use for gossip'
-                         'cf. the gossip_module graph_manager for available'
+                         'cf. the gossip graph_manager for available'
                          'graph topologies and their corresponding int-id')
 parser.add_argument('--mixing_strategy', default=0, type=int,
                     help='the mixing strategy to use for gossip'
-                         'cf. the gossip_module mixing_manager for available'
+                         'cf. the gossip mixing_manager for available'
                          'mixing strategies and their corresponding int-id.')
 parser.add_argument('--schedule', nargs='+', type=float,
                     help='learning rate schedule')
