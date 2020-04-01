@@ -26,7 +26,6 @@ In addition, you will need to install
 * [torchvision 0.2.1](https://github.com/pytorch/vision/tree/v0.2.1) for the ResNet-50 model
 * matplotlib 2.2.2 for producing figures
 * pandas 0.24.1 for loading results from CSV files
-* [apex](https://github.com/NVIDIA/apex/tree/1b903852aecd388e10f03e470fcb1993f1c871dd) for fp16
 
 ## Running Experiments
 ### Training ResNet-50 on ImageNet
