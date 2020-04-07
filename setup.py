@@ -29,7 +29,6 @@ if __name__ == "__main__":
         license="Attribution-NonCommercial 4.0 International",
         python_requires=">=3.6",
         packages=find_packages(),
-        # package_dir={"": "gossip"},
         install_requires=reqs.strip().split("\n"),
         extras_require={
             "parse": [
