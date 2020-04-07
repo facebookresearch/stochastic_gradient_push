@@ -28,7 +28,6 @@ from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import scatter_kwargs, gather
 from torch.nn.parallel.parallel_apply import parallel_apply
 
-from .utils import get_tcp_interface_name
 from .gossiper import BilatPushPull
 from .utils import make_logger, flatten_tensors, unflatten_tensors
 from .utils.metering import Meter
@@ -41,7 +40,8 @@ class BilatGossipDataParallel(Module):
                  master_port=None, backend=None, world_size=None, rank=None,
                  graph_class=None, mixing_class=None, num_peers=1,
                  comm_device=None, lr=0.1, momentum=0.9, weight_decay=1e-4,
-                 nesterov=True, verbose=True, network_interface_type=None):
+                 nesterov=True, verbose=True, network_interface_type=None,
+                 tcp_interface_name=None):
         super(BilatGossipDataParallel, self).__init__()
 
         # devices available locally
@@ -126,7 +126,8 @@ class BilatGossipDataParallel(Module):
                   self.gossip_update_flag,
                   self._lr,
                   self.gossip_lock,
-                  self.gossip_queue))
+                  self.gossip_queue,
+                  tcp_interface_name))
         self.gossip_thread.daemon = True
         self.gossip_thread.name = 'Gossip-Thread'
         self.gossip_thread.start()
@@ -251,7 +252,7 @@ class BilatGossipDataParallel(Module):
     @staticmethod
     def _gossip_target(dist_config, gossip_enable_flag, train_write_flag,
                        gossip_read_flag, gossip_update_flag, gossip_lr,
-                       gossip_lock, gossip_queue):
+                       gossip_lock, gossip_queue, tcp_interface_name):
         """ Gossip thread, which performs push-sum on model params """
         with torch.no_grad():
             gossip_params, gossip_grads = gossip_queue.get()
@@ -268,14 +269,10 @@ class BilatGossipDataParallel(Module):
                 assert dist_config['network_interface_type'] == 'ethernet'
             elif dist_config['network_interface_type'] == 'ethernet':
                 if dist_config['backend'] == 'nccl':
-                    os.environ['NCCL_SOCKET_IFNAME'] = get_tcp_interface_name(
-                        network_interface_type=dist_config['network_interface_type']
-                    )
+                    os.environ['NCCL_SOCKET_IFNAME'] = tcp_interface_name
                     os.environ['NCCL_IB_DISABLE'] = '1'
                 elif dist_config['backend'] == 'gloo':
-                    os.environ['GLOO_SOCKET_IFNAME'] = get_tcp_interface_name(
-                        network_interface_type=dist_config['network_interface_type']
-                    )
+                    os.environ['GLOO_SOCKET_IFNAME'] = tcp_interface_name
                 else:
                     raise NotImplementedError
 
