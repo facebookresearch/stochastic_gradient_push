@@ -170,7 +170,11 @@ def main():
         comm_device=args.comm_device, lr=args.lr, momentum=args.momentum,
         weight_decay=args.weight_decay, nesterov=args.nesterov,
         verbose=args.verbose, num_peers=args.ppi_schedule[0],
-        network_interface_type=args.network_interface_type)
+        network_interface_type=args.network_interface_type,
+        tcp_interface_name=get_tcp_interface_name(
+            network_interface_type=args.network_interface_type
+        )
+    )
 
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.SGD(model.parameters(),

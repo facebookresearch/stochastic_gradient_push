@@ -20,12 +20,19 @@ All code runs on Python 3.6.7 using [PyTorch version 1.0.0](https://github.com/p
 
 Our implementations build on the `torch.distributed` package in PyTorch, which provides an interface for exchanging tensors between multiple machines. The `torch.distributed` package in PyTorch v.1.0.0 can use different backends. We recommmend using NCCL for all algorithms (this is the default).
 
-* You could run `./scripts/setup.sh` to install all the dependencies. You may have to change the CUDA version etc  (in the `requirements.txt` file) to match your setup.
+To install the Stochastic Gradient Push library, via pip:
+```bash
+git clone https://github.com/facebookresearch/stochastic_gradient_push.git
+cd stochastic_gradient_push
+pip install .
+```
 
-In addition, you will need to install
-* [torchvision 0.2.1](https://github.com/pytorch/vision/tree/v0.2.1) for the ResNet-50 model
-* matplotlib 2.2.2 for producing figures
-* pandas 0.24.1 for loading results from CSV files
+If you want to use the parsing scripts to parse results, you can instead do:
+```bash
+git clone https://github.com/facebookresearch/stochastic_gradient_push.git
+cd stochastic_gradient_push
+pip install -e .[parse]
+```
 
 ## Running Experiments
 ### Training ResNet-50 on ImageNet
